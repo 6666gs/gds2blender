@@ -35,12 +35,16 @@ class GDSSceneProperties(bpy.types.PropertyGroup):
     scale: bpy.props.FloatProperty(name="缩放 (微米)", default=1.0, min=0.001)
     
     use_substrate: bpy.props.BoolProperty(name="生成基底 (Substrate)", default=True)
-    sub_z_start: bpy.props.FloatProperty(name="基底顶面高度", default=-0.22, step=10) # 默认下降，留出刻蚀层空间
+    sub_z_start: bpy.props.FloatProperty(name="基底顶面高度", default=-0.22, step=10)
     sub_thickness: bpy.props.FloatProperty(name="基底厚度", default=5.0, min=0.1, step=10)
     sub_color: bpy.props.FloatVectorProperty(
-        name="基底颜色", subtype='COLOR', size=4, 
-        default=(0.15, 0.15, 0.15, 1.0), min=0.0, max=1.0 
+        name="基底颜色", subtype='COLOR', size=4,
+        default=(0.15, 0.15, 0.15, 1.0), min=0.0, max=1.0
     )
+    sub_pad_xmin: bpy.props.FloatProperty(name="X- 增量", default=10.0, min=0.0, step=10)
+    sub_pad_xmax: bpy.props.FloatProperty(name="X+ 增量", default=10.0, min=0.0, step=10)
+    sub_pad_ymin: bpy.props.FloatProperty(name="Y- 增量", default=10.0, min=0.0, step=10)
+    sub_pad_ymax: bpy.props.FloatProperty(name="Y+ 增量", default=10.0, min=0.0, step=10)
     
     layers: bpy.props.CollectionProperty(type=GDSLayerItem)
 
@@ -112,29 +116,30 @@ class GDS_OT_Generate3D(bpy.types.Operator):
         lib = gdspy.GdsLibrary(infile=props.filepath)
         top_cell = next((c for c in lib.top_level() if not c.name.startswith('$$$')), lib.top_level()[-1])
         
-        # 定义基底外扩边缘 (微米)
-        GDS_PAD = 10.0
         bbox = top_cell.get_bounding_box()
-        
+
         if props.use_substrate and bbox is not None:
             (xmin, ymin), (xmax, ymax) = bbox
-            self.create_substrate(xmin, ymin, xmax, ymax, GDS_PAD, props, chip_root)
+            self.create_substrate(xmin, ymin, xmax, ymax, props, chip_root)
 
         all_polys = top_cell.get_polygons(by_spec=True)
-        
+
         for item in props.layers:
             if not item.is_active: continue
             spec = (item.layer_num, item.datatype_num)
             if spec not in all_polys: continue
-            
+
             raw_polys = all_polys[spec]
             target_polys = raw_polys
-            
+
             # --- 核心更新：2D 掩膜反转刻蚀法 ---
             if item.extrude_dir == 'DOWN' and bbox is not None:
                 (xmin, ymin), (xmax, ymax) = bbox
-                # 创建一个和基底完全一样大的虚拟外框
-                rect = gdspy.Rectangle((xmin - GDS_PAD, ymin - GDS_PAD), (xmax + GDS_PAD, ymax + GDS_PAD))
+                # 刻蚀掩膜与基底保持相同边界
+                rect = gdspy.Rectangle(
+                    (xmin - props.sub_pad_xmin, ymin - props.sub_pad_ymin),
+                    (xmax + props.sub_pad_xmax, ymax + props.sub_pad_ymax)
+                )
                 try:
                     print(f"[{item.layer_name}] 正在计算 2D 刻蚀掩膜 (这可能需要几秒钟)...")
                     # 使用 gdspy 高效运算：外框 减去 波导形状
@@ -152,21 +157,21 @@ class GDS_OT_Generate3D(bpy.types.Operator):
         self.report({'INFO'}, f"渲染完成！耗时: {end_time - start_time:.2f} 秒")
         return {'FINISHED'}
 
-    def create_substrate(self, xmin, ymin, xmax, ymax, pad, props, parent):
+    def create_substrate(self, xmin, ymin, xmax, ymax, props, parent):
         name = "GDS_Substrate"
         mesh = bpy.data.meshes.new(name)
         obj = bpy.data.objects.new(name, mesh)
         bpy.context.collection.objects.link(obj)
         obj.parent = parent
-        
+
         s = props.scale
         z0 = props.sub_z_start * s
-        
+
         verts = [
-            ((xmin - pad) * s, (ymin - pad) * s, z0),
-            ((xmax + pad) * s, (ymin - pad) * s, z0),
-            ((xmax + pad) * s, (ymax + pad) * s, z0),
-            ((xmin - pad) * s, (ymax + pad) * s, z0)
+            ((xmin - props.sub_pad_xmin) * s, (ymin - props.sub_pad_ymin) * s, z0),
+            ((xmax + props.sub_pad_xmax) * s, (ymin - props.sub_pad_ymin) * s, z0),
+            ((xmax + props.sub_pad_xmax) * s, (ymax + props.sub_pad_ymax) * s, z0),
+            ((xmin - props.sub_pad_xmin) * s, (ymax + props.sub_pad_ymax) * s, z0)
         ]
         faces = [[0, 1, 2, 3]]
         
@@ -284,6 +289,14 @@ class GDS_PT_MainPanel(bpy.types.Panel):
             sub_box.prop(props, "sub_z_start")
             sub_box.prop(props, "sub_thickness")
             sub_box.prop(props, "sub_color")
+            sub_box.separator()
+            sub_box.label(text="基底外扩增量 (微米):")
+            col = sub_box.column(align=True)
+            col.prop(props, "sub_pad_ymax", text="Y+")
+            row = col.row(align=True)
+            row.prop(props, "sub_pad_xmin", text="X-")
+            row.prop(props, "sub_pad_xmax", text="X+")
+            col.prop(props, "sub_pad_ymin", text="Y-")
         
         if len(props.layers) > 0:
             layout.separator()
