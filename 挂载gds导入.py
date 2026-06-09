@@ -45,7 +45,13 @@ class GDSSceneProperties(bpy.types.PropertyGroup):
     sub_pad_xmax: bpy.props.FloatProperty(name="X+ 增量", default=10.0, min=0.0, step=10)
     sub_pad_ymin: bpy.props.FloatProperty(name="Y- 增量", default=10.0, min=0.0, step=10)
     sub_pad_ymax: bpy.props.FloatProperty(name="Y+ 增量", default=10.0, min=0.0, step=10)
-    
+
+    keep_existing: bpy.props.BoolProperty(
+        name="保留已有模型",
+        description="勾选后在场景中新增模型，而不清除现有的 GDS 模型",
+        default=False
+    )
+
     layers: bpy.props.CollectionProperty(type=GDSLayerItem)
 
 # ==========================================
@@ -103,13 +109,22 @@ class GDS_OT_Generate3D(bpy.types.Operator):
 
         start_time = time.time()
         
-        root_name = "GDS_Chip_Root"
-        if root_name in bpy.data.objects:
-            root_obj = bpy.data.objects[root_name]
-            for child in root_obj.children:
-                bpy.data.objects.remove(child, do_unlink=True)
-            bpy.data.objects.remove(root_obj, do_unlink=True)
-            
+        base_name = "GDS_Chip_Root"
+        if props.keep_existing:
+            # 自动寻找未被占用的编号名称
+            root_name = base_name
+            idx = 1
+            while root_name in bpy.data.objects:
+                root_name = f"{base_name}_{idx:03d}"
+                idx += 1
+        else:
+            root_name = base_name
+            if root_name in bpy.data.objects:
+                root_obj = bpy.data.objects[root_name]
+                for child in root_obj.children:
+                    bpy.data.objects.remove(child, do_unlink=True)
+                bpy.data.objects.remove(root_obj, do_unlink=True)
+
         chip_root = bpy.data.objects.new(root_name, None)
         bpy.context.collection.objects.link(chip_root)
 
@@ -316,6 +331,7 @@ class GDS_PT_MainPanel(bpy.types.Panel):
                     col.prop(item, "thickness")
 
             layout.separator()
+            layout.prop(props, "keep_existing", icon='DUPLICATE')
             layout.scale_y = 1.5
             layout.operator("gds.generate_3d", icon='MOD_BUILD')
 
