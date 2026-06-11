@@ -16,10 +16,16 @@ from mathutils import Vector
 
 # ── 0. 排版参数（按论文版面改这里） ──────────────────────────────
 TARGET_WIDTH_MM = 180.0  # 双栏宽；单栏用 ~88
-TARGET_DPI = 600
 ASPECT = 0.5  # 高/宽 比
-RENDER_SAMPLES = 1024
 PREFIX = "FIG_"  # 脚本创建对象的统一前缀，保证幂等重建
+
+# ── 性能/质量：先用草稿模式快速预览，满意后把 DRAFT 改成 False 出高清 ──
+DRAFT = True
+TARGET_DPI = 150 if DRAFT else 600  # 草稿≈1063×531；出版 600dpi≈4252×2126
+RENDER_SAMPLES = 64 if DRAFT else 1024  # 采样数；配合降噪，草稿 64 已足够干净
+
+# ── 画面整体曝光（单位=档/EV），负值更暗。太亮就调更负(如 -4)，太暗就调大 ──
+EXPOSURE = -3.0
 
 
 def mm_to_px(mm, dpi):
@@ -31,22 +37,62 @@ RES_Y = int(RES_X * ASPECT)
 
 
 # ── 工具：按候选名设置 BSDF 输入，兼容不同版本接口名 ─────────────
+#   同时按 socket 的 name 和 identifier 匹配：identifier 始终是英文规范名，
+#   即使 Blender 界面是中文（开启"翻译→新建数据"）也能命中。
 def _set(bsdf, names, value):
+    if bsdf is None:
+        return False
     names = [names] if isinstance(names, str) else names
     for n in names:
-        if n in bsdf.inputs:
-            bsdf.inputs[n].default_value = value
-            return True
+        for sock in bsdf.inputs:
+            if sock.name == n or sock.identifier == n:
+                sock.default_value = value
+                return True
     return False
+
+
+# ── 工具：按节点类型查找，避免界面语言/"翻译新建数据"导致节点名不是英文 ──
+#   node.type 始终是英文枚举（如 'BSDF_PRINCIPLED'），不受 UI 语言影响。
+def _node_of_type(nodes, type_name):
+    for node in nodes:
+        if node.type == type_name:
+            return node
+    return None
+
+
+# ── 工具：尽量启用 GPU 渲染（N卡 OptiX/CUDA、A卡 HIP、Intel oneAPI），失败回退 CPU ──
+def enable_gpu(scene):
+    try:
+        prefs = bpy.context.preferences.addons['cycles'].preferences
+    except (KeyError, AttributeError):
+        scene.cycles.device = 'CPU'
+        return "CPU（未找到 Cycles 偏好）"
+    for backend in ('OPTIX', 'CUDA', 'HIP', 'ONEAPI', 'METAL'):
+        try:
+            prefs.compute_device_type = backend
+        except (TypeError, AttributeError):
+            continue  # 当前系统不支持该后端
+        try:
+            prefs.get_devices()
+        except Exception:
+            try:
+                prefs.refresh_devices()
+            except Exception:
+                pass
+        gpus = [d for d in prefs.devices if d.type == backend]
+        if gpus:
+            for d in prefs.devices:
+                d.use = (d.type == backend)  # 仅启用该后端的 GPU 设备
+            scene.cycles.device = 'GPU'
+            return f"GPU（{backend}）：" + "，".join(g.name for g in gpus)
+    scene.cycles.device = 'CPU'
+    return "CPU（未检测到受支持的 GPU；核显多数走 CPU）"
 
 
 # ── 1. 渲染设置：Cycles + 去噪 + 透明背景 + 16bit PNG ────────────
 def setup_render(scene):
     scene.render.engine = 'CYCLES'
-    try:
-        scene.cycles.device = 'GPU'  # 需先在 偏好设置 里启用 GPU
-    except Exception:
-        pass
+    print("Render device:", enable_gpu(scene))
     cyc = scene.cycles
     cyc.samples = RENDER_SAMPLES
     cyc.use_denoising = True
@@ -70,6 +116,7 @@ def setup_render(scene):
 
     scene.view_settings.view_transform = 'Standard'  # 示意图：颜色平实准确
     scene.view_settings.look = 'None'
+    scene.view_settings.exposure = EXPOSURE  # 整体压暗：灯光过曝白成一片时往更负调
 
 
 # ── 2. 世界环境：冷白低强度补光，避免全黑反射 ──────────────────
@@ -77,10 +124,10 @@ def setup_world(scene):
     world = scene.world or bpy.data.worlds.new(PREFIX + "World")
     scene.world = world
     world.use_nodes = True
-    bg = world.node_tree.nodes.get("Background")
+    bg = _node_of_type(world.node_tree.nodes, 'BACKGROUND')
     if bg:
-        bg.inputs["Color"].default_value = (0.90, 0.92, 0.95, 1.0)
-        bg.inputs["Strength"].default_value = 0.4
+        _set(bg, "Color", (0.90, 0.92, 0.95, 1.0))
+        _set(bg, "Strength", 0.4)
 
 
 # ── 3. 场景包围盒（用于按模型尺度自适应放相机/灯，避免写死单位） ──
@@ -150,7 +197,13 @@ def _new_material(name):
         bpy.data.materials.remove(old)
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
-    return mat, mat.node_tree.nodes.get("Principled BSDF")
+    nt = mat.node_tree
+    bsdf = _node_of_type(nt.nodes, 'BSDF_PRINCIPLED')
+    if bsdf is None:  # 极少数情况默认节点缺失：自建并接到材质输出（用索引连，避免名字依赖）
+        bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+        out = _node_of_type(nt.nodes, 'OUTPUT_MATERIAL') or nt.nodes.new("ShaderNodeOutputMaterial")
+        nt.links.new(bsdf.outputs[0], out.inputs[0])
+    return mat, bsdf
 
 
 def mat_sio2_blue():  # 蓝色 SiO₂ 板体：光泽 + 清漆高光
@@ -241,6 +294,23 @@ def apply_material(keyword, mat):
     print(f"  [{keyword}] -> {n} object(s)")
 
 
+def assign_material(obj_name, mat):
+    """按【精确物体名】指派材质，替换该物体的全部材质槽。"""
+    obj = bpy.data.objects.get(obj_name)
+    if obj is None:
+        print(f"  ⚠ 找不到物体：{obj_name!r}")
+        return
+    if obj.type != 'MESH':
+        print(f"  ⚠ {obj_name!r} 不是网格，跳过")
+        return
+    # 数据被多物体共享时（见下方说明）先转单用户，避免改一个连带改了另一个
+    if obj.data.users > 1:
+        obj.data = obj.data.copy()
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+    print(f"  ✓ {obj_name!r} ← {mat.name}")
+
+
 # ── 主流程 ──────────────────────────────────────────────────
 def main():
     scene = bpy.context.scene
@@ -279,16 +349,21 @@ def main():
     add_shadow_catcher(center, diag, mins.z)
 
     # 把关键字改成你工程里的实际物体名！
-    apply_material("SiO2", mat_sio2_blue())
-    apply_material("TFLN", mat_tfln_violet())
-    apply_material("Si_sub", mat_si_dark())  # 给硅衬底起含 Si_sub 的唯一名
-    apply_material("Au", mat_gold())
-    apply_material("electrode", mat_gold())
-    apply_material("RSOA", mat_gold_grainy())
-    apply_material("submount", mat_submount_gray())
-    apply_material("waveguide", mat_waveguide_cyan())
-    apply_material("grating", mat_waveguide_cyan())
-    apply_material("probe", mat_probe_dark())
+    # apply_material("SiO2", mat_sio2_blue())
+    # apply_material("TFLN", mat_tfln_violet())
+    # apply_material("Si_sub", mat_si_dark())  # 给硅衬底起含 Si_sub 的唯一名
+    # apply_material("Au", mat_gold())
+    # apply_material("electrode", mat_gold())
+    # apply_material("RSOA", mat_gold_grainy())
+    # apply_material("submount", mat_submount_gray())
+    # apply_material("waveguide", mat_waveguide_cyan())
+    # apply_material("grating", mat_waveguide_cyan())
+    # apply_material("probe", mat_probe_dark())
+
+    # 用你大纲里的真实名字，一一对应：
+    assign_material("GDS_Substrate.002", mat_sio2_blue())  # 衬底/板体 → 光泽蓝介质
+    assign_material("Layer 41/0.001", mat_waveguide_cyan())  # 铌酸锂波导 → 青色自发光
+    assign_material("Layer 46/0.001", mat_gold())  # Au 电极   → 金属金
 
     print(f"FIG setup done. Resolution: {RES_X} x {RES_Y}")
 
