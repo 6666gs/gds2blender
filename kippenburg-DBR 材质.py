@@ -206,12 +206,28 @@ def _new_material(name):
     return mat, bsdf
 
 
-def mat_sio2_blue():  # 蓝色 SiO₂ 板体：光泽 + 清漆高光
+def mat_sio2_blue():  # 蓝色 SiO₂ 板体（底部埋层/薄膜底包层）：光泽 + 清漆高光
     mat, b = _new_material(PREFIX + "SiO2_Blue")
     _set(b, "Base Color", (0.05, 0.22, 0.85, 1.0))
     _set(b, "Roughness", 0.18)
     _set(b, ["Coat Weight", "Clearcoat"], 0.4)
     _set(b, ["Coat Roughness", "Clearcoat Roughness"], 0.05)
+    return mat
+
+
+def mat_sio2_clad_clear():  # 透明 SiO₂ 上包层：玻璃质感，透出下方 LNOI 波导/光栅
+    mat, b = _new_material(PREFIX + "SiO2_Clad_Clear")
+    _set(b, "Base Color", (0.92, 0.96, 1.0, 1.0))             # 近无色，极淡冷调
+    _set(b, ["Transmission Weight", "Transmission"], 1.0)      # 全透射 → 玻璃
+    _set(b, "Roughness", 0.03)                                # 越小越清澈
+    _set(b, "IOR", 1.45)                                      # 熔融石英折射率
+    # EEVEE 预览也想透时打开屏幕折射；Cycles 下该属性无害（无此属性的老版本会被跳过）
+    if hasattr(mat, "use_screen_refraction"):
+        mat.use_screen_refraction = True
+    # 提示：若觉得玻璃折射把下方结构扭曲得太厉害（示意图想要“平贴覆盖”观感），
+    # 可改用 Alpha 半透明：把上面 Transmission 改回 0，并启用下面两行——
+    #   _set(b, "Alpha", 0.25)
+    #   mat.blend_method = 'BLEND'   # 仅 EEVEE 需要；Cycles 直接按 Alpha 透明
     return mat
 
 
@@ -271,6 +287,14 @@ def mat_waveguide_cyan():  # 波导 + 光栅点阵：自发光青色
     return mat
 
 
+def mat_rsoa_red():  # InP RSOA 增益区波导：红色自发光（自发辐射）
+    mat, b = _new_material(PREFIX + "RSOA_Red")
+    _set(b, "Base Color", (0.60, 0.02, 0.02, 1.0))
+    _set(b, ["Emission Color", "Emission"], (1.0, 0.06, 0.03, 1.0))
+    _set(b, "Emission Strength", 5.0)  # 想更亮/更晕就调大
+    return mat
+
+
 def mat_probe_dark():  # 探针：深色金属
     mat, b = _new_material(PREFIX + "Probe_Dark")
     _set(b, "Base Color", (0.04, 0.04, 0.05, 1.0))
@@ -288,27 +312,41 @@ def apply_material(keyword, mat):
         if obj.type != 'MESH' or obj.name.startswith(PREFIX):
             continue
         if keyword.lower() in obj.name.lower():
+            if obj.data.users > 1:  # 共享网格先转单用户，避免连带改到别的物体
+                obj.data = obj.data.copy()
             obj.data.materials.clear()
             obj.data.materials.append(mat)
             n += 1
     print(f"  [{keyword}] -> {n} object(s)")
 
 
-def assign_material(obj_name, mat):
-    """按【精确物体名】指派材质，替换该物体的全部材质槽。"""
-    obj = bpy.data.objects.get(obj_name)
-    if obj is None:
-        print(f"  ⚠ 找不到物体：{obj_name!r}")
-        return
-    if obj.type != 'MESH':
-        print(f"  ⚠ {obj_name!r} 不是网格，跳过")
-        return
-    # 数据被多物体共享时（见下方说明）先转单用户，避免改一个连带改了另一个
-    if obj.data.users > 1:
-        obj.data = obj.data.copy()
-    obj.data.materials.clear()
-    obj.data.materials.append(mat)
-    print(f"  ✓ {obj_name!r} ← {mat.name}")
+def assign_material(obj_names, mat):
+    """按【精确物体名】把【同一个】材质指派给一个或多个物体，替换其全部材质槽。
+
+    obj_names: 单个物体名字符串，或物体名列表，例如：
+        wg = mat_waveguide_cyan()                 # 只调用工厂【一次】，拿到材质对象
+        assign_material("Layer 41/0.001", wg)     # 单个
+        assign_material(["Layer 41/0.001", "Layer 42/0.001"], wg)  # 多个共用
+
+    ⚠ 多物体共用同一材质时，务必只调用一次材质工厂函数（mat_xxx()）并复用返回的
+      mat 对象。【不要】对每个物体各调一次工厂——工厂内部会先 remove 掉同名旧材质，
+      而 remove 会把该材质从【所有】已指派的物体上解绑，导致只有最后一个物体留住材质。
+    """
+    names = [obj_names] if isinstance(obj_names, str) else list(obj_names)
+    for obj_name in names:
+        obj = bpy.data.objects.get(obj_name)
+        if obj is None:
+            print(f"  ⚠ 找不到物体：{obj_name!r}")
+            continue
+        if obj.type != 'MESH':
+            print(f"  ⚠ {obj_name!r} 不是网格，跳过")
+            continue
+        # 网格数据被多物体共享时先转单用户，避免改一个连带改了另一个
+        if obj.data.users > 1:
+            obj.data = obj.data.copy()
+        obj.data.materials.clear()
+        obj.data.materials.append(mat)
+        print(f"  ✓ {obj_name!r} ← {mat.name}")
 
 
 # ── 主流程 ──────────────────────────────────────────────────
@@ -360,10 +398,23 @@ def main():
     # apply_material("grating", mat_waveguide_cyan())
     # apply_material("probe", mat_probe_dark())
 
-    # 用你大纲里的真实名字，一一对应：
-    assign_material("GDS_Substrate.002", mat_sio2_blue())  # 衬底/板体 → 光泽蓝介质
-    assign_material("Layer 41/0.001", mat_waveguide_cyan())  # 铌酸锂波导 → 青色自发光
-    assign_material("Layer 46/0.001", mat_gold())  # Au 电极   → 金属金
+    # 用你大纲里的真实名字，一一对应。
+    # ★ 多个物体共用同一材质：把工厂函数的返回值【先存进变量】，再传给 assign_material，
+    #   并用列表一次性指给多个物体；切勿对每个物体各调一次 mat_xxx()（见 assign_material 注释）。
+    sio2_blue = mat_sio2_blue()           # 底部 SiO₂ 埋层/薄膜底包层 → 蓝色介质
+    sio2_clad = mat_sio2_clad_clear()     # 上方 SiO₂ 包层 → 透明玻璃
+    wg_cyan = mat_waveguide_cyan()        # 外腔 LNOI 波导/光栅 → 青色自发光
+    rsoa_red = mat_rsoa_red()             # RSOA 增益区波导 → 红色自发光
+    gold = mat_gold()                     # Au 电极 → 金属金
+
+    assign_material("GDS_Substrate.002", sio2_blue)
+    assign_material("Layer 41/0.001", wg_cyan)
+    assign_material("Layer 46/0.001", gold)
+
+    # —— 新增材质的指派示例（把名字换成你工程里的真实物体名；多个名字用列表）——
+    # assign_material(["LNOI_Cladding", "SiO2_Top.001"], sio2_clad)   # 透明上包层（可多块共用）
+    # assign_material("RSOA_Waveguide", rsoa_red)                     # RSOA 红色自发光波导
+    # assign_material(["Layer 41/0.001", "Layer 41/0.002"], wg_cyan)  # 同一青色材质给多段波导
 
     print(f"FIG setup done. Resolution: {RES_X} x {RES_Y}")
 
