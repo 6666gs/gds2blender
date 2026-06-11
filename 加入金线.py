@@ -39,6 +39,24 @@
      注意：此处是相对物体原点的【局部】坐标，若该物体有位移/旋转，
      结果会和世界坐标不一致——这种情况请改用方法 A。
 
+方法 D —— 没有焊盘、只有一个平整面（如 submount 上表面）时取任意点★
+  思路：平整顶面上各处高度 Z 相同，所以只要确定「顶面 Z」+「想放线的 X,Y」。
+  做法一（脚本打印面范围，最省事）：
+    在 Blender 的 Python 控制台运行：  print_object_top("Submount")
+    （把 "Submount" 换成你那个面/物体的真实名字）
+    它会打印该物体的 X 范围、Y 范围、顶面 Z。然后在 X/Y 范围内自己挑两点，
+    Z 一律填打印出的顶面 Z，就得到 railA_start / railA_end，例如：
+        railA_start = (x1, y1, z_top)
+        railA_end   = (x2, y2, z_top)
+  做法二（视口在面上直接点取一点）：
+    1. 把鼠标移到面上你想要的位置，按 Shift + 鼠标右键 —— 3D 光标会“贴”到
+       该面表面那一点（Blender 默认会把光标投影到鼠标下的几何表面）；
+       若没贴上，改用左侧工具栏的「游标 / Cursor」工具，在其工具设置里把
+       放置方式设为「表面 / Surface」，再在面上左键点一下即可。
+    2. 运行 print_cursor() 或看 N →「视图 / View」→「3D 游标」→ Location，
+       即得到该点的世界坐标。换地方再点一次，得到第二个端点。
+  说明：金线连接【两个】端点，另一端（比如 RSOA/电极顶面）同样用本方法取点。
+
 ═══════════════════════════════════════════════════════════════════════
 四、怎么填 railA / railB 参数
 ═══════════════════════════════════════════════════════════════════════
@@ -165,6 +183,33 @@ def print_selected():
     loc = obj.matrix_world.translation
     print(f"{obj.name} 世界坐标: ({loc.x:.4f}, {loc.y:.4f}, {loc.z:.4f})")
     return (round(loc.x, 4), round(loc.y, 4), round(loc.z, 4))
+
+
+def print_object_top(obj_name):
+    """打印某物体（如 submount）的世界包围盒：X/Y 范围 + 顶面/底面 Z。
+
+    没有焊盘、只有一个平整上表面时最好用：顶面各处 Z 相同，
+    所以只要在打印出的 X、Y 范围内自选两点的 (x, y)，Z 一律用 z_top 即可，
+    例如 railA_start = (x1, y1, z_top)、railA_end = (x2, y2, z_top)。
+    """
+    obj = bpy.data.objects.get(obj_name)
+    if obj is None:
+        print(f"⚠ 找不到物体：{obj_name!r}")
+        return None
+    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    xs = [c.x for c in corners]
+    ys = [c.y for c in corners]
+    zs = [c.z for c in corners]
+    print(f"{obj_name} 世界包围盒：")
+    print(f"  X 范围: {min(xs):.4f} ~ {max(xs):.4f}")
+    print(f"  Y 范围: {min(ys):.4f} ~ {max(ys):.4f}")
+    print(f"  顶面 Z(最高): {max(zs):.4f}    底面 Z(最低): {min(zs):.4f}")
+    return {
+        "x": (round(min(xs), 4), round(max(xs), 4)),
+        "y": (round(min(ys), 4), round(max(ys), 4)),
+        "z_top": round(max(zs), 4),
+        "z_bot": round(min(zs), 4),
+    }
 
 
 # ─── 用法：把下面坐标/数值改成你模型里的真实值 ───────────────
