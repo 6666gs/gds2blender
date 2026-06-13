@@ -3,6 +3,7 @@ import bmesh
 import gdspy
 import os
 import time
+import json
 
 # ==========================================
 # 1. 数据结构
@@ -46,16 +47,102 @@ class GDSSceneProperties(bpy.types.PropertyGroup):
     sub_pad_ymin: bpy.props.FloatProperty(name="Y- 增量", default=10.0, min=0.0, step=10)
     sub_pad_ymax: bpy.props.FloatProperty(name="Y+ 增量", default=10.0, min=0.0, step=10)
 
-    keep_existing: bpy.props.BoolProperty(
-        name="保留已有模型",
-        description="勾选后在场景中新增模型，而不清除现有的 GDS 模型",
-        default=False
+    struct_name: bpy.props.StringProperty(
+        name="结构名称",
+        description="本次生成结构的根物体名称",
+        default="GDS_Chip"
+    )
+    overwrite_same: bpy.props.BoolProperty(
+        name="覆盖同名结构",
+        description="勾选：若已存在同名结构则删除重建（定向更新某个结构，其它结构不受影响）；取消：自动编号新建",
+        default=True
     )
 
     layers: bpy.props.CollectionProperty(type=GDSLayerItem)
 
 # ==========================================
-# 2. 读取 GDS 
+# 1.5 配置存取 (旁路 JSON)
+# ==========================================
+def _sidecar_path(filepath):
+    """配置文件 = GDS 路径 + .layers.json"""
+    return bpy.path.abspath(filepath) + ".layers.json"
+
+def _color4(c):
+    """转成长度为 4 的 RGBA 元组"""
+    c = list(c)
+    if len(c) < 4:
+        c = c + [1.0] * (4 - len(c))
+    return tuple(c[:4])
+
+def _config_from_props(props):
+    return {
+        "schema": 1,
+        "source": os.path.basename(bpy.path.abspath(props.filepath)),
+        "scale": props.scale,
+        "substrate": {
+            "use": props.use_substrate,
+            "z_start": props.sub_z_start,
+            "thickness": props.sub_thickness,
+            "color": list(props.sub_color),
+            "pad": [props.sub_pad_xmin, props.sub_pad_xmax,
+                    props.sub_pad_ymin, props.sub_pad_ymax],
+        },
+        "layers": [
+            {
+                "layer": it.layer_num,
+                "datatype": it.datatype_num,
+                "name": it.layer_name,
+                "active": it.is_active,
+                "dir": it.extrude_dir,
+                "z_start": it.z_start,
+                "thickness": it.thickness,
+                "color": list(it.color),
+            }
+            for it in props.layers
+        ],
+    }
+
+def _apply_config(props, data):
+    """把配置 dict 套用到 props。返回 (ok, message)。
+    校验：当前已载入层的 (层号, 数据类型) 集合 必须与配置完全一致，否则失败。"""
+    cur = {(it.layer_num, it.datatype_num) for it in props.layers}
+    saved = {(l["layer"], l["datatype"]) for l in data.get("layers", [])}
+    if cur != saved:
+        return False, (f"层不匹配：当前 {len(cur)} 层，配置 {len(saved)} 层"
+                       f"（按 层号/数据类型 集合比较）")
+
+    if "scale" in data:
+        props.scale = data["scale"]
+
+    sub = data.get("substrate")
+    if sub:
+        props.use_substrate = sub.get("use", props.use_substrate)
+        props.sub_z_start = sub.get("z_start", props.sub_z_start)
+        props.sub_thickness = sub.get("thickness", props.sub_thickness)
+        if "color" in sub:
+            props.sub_color = _color4(sub["color"])
+        pad = sub.get("pad")
+        if pad and len(pad) == 4:
+            props.sub_pad_xmin, props.sub_pad_xmax, props.sub_pad_ymin, props.sub_pad_ymax = pad
+
+    by_key = {(l["layer"], l["datatype"]): l for l in data.get("layers", [])}
+    for it in props.layers:
+        l = by_key.get((it.layer_num, it.datatype_num))
+        if not l:
+            continue
+        it.is_active = l.get("active", it.is_active)
+        if "dir" in l:
+            it.extrude_dir = l["dir"]
+        it.z_start = l.get("z_start", it.z_start)
+        it.thickness = l.get("thickness", it.thickness)
+        if "name" in l:
+            it.layer_name = l["name"]
+        if "color" in l:
+            it.color = _color4(l["color"])
+    return True, f"已套用配置（{len(saved)} 层）"
+
+# ==========================================
+# 2. 读取 GDS
 # ==========================================
 class GDS_OT_LoadLayers(bpy.types.Operator):
     bl_idname = "gds.load_layers"
@@ -88,12 +175,82 @@ class GDS_OT_LoadLayers(bpy.types.Operator):
                     item.color = (0.15, 0.15, 0.25, 1.0)
                     item.thickness = 0.22
                 
-                current_z += item.thickness + 0.1 
-                
-            self.report({'INFO'}, f"成功读取 {len(props.layers)} 个层！")
+                current_z += item.thickness + 0.1
+
+            # 自动尝试套用旁路配置（若存在）
+            auto_path = _sidecar_path(props.filepath)
+            if os.path.exists(auto_path):
+                try:
+                    with open(auto_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    ok, msg = _apply_config(props, data)
+                    if ok:
+                        self.report({'INFO'}, f"成功读取 {len(props.layers)} 个层，并自动套用配置")
+                    else:
+                        self.report({'WARNING'}, f"读取 {len(props.layers)} 层；配置未套用 - {msg}")
+                except Exception as e:
+                    self.report({'WARNING'}, f"读取 {len(props.layers)} 层；配置解析失败: {e}")
+            else:
+                self.report({'INFO'}, f"成功读取 {len(props.layers)} 个层！")
         except Exception as e:
             self.report({'ERROR'}, f"读取失败: {e}")
             
+        return {'FINISHED'}
+
+# ==========================================
+# 2.5 配置 保存 / 载入 Operator
+# ==========================================
+class GDS_OT_SaveConfig(bpy.types.Operator):
+    bl_idname = "gds.save_config"
+    bl_label = "保存配置"
+    bl_description = "把当前各层参数 + 基底 + 缩放写入 GDS 旁的 .layers.json"
+
+    def execute(self, context):
+        props = context.scene.gds_props
+        if not props.filepath:
+            self.report({'ERROR'}, "请先指定 GDS 文件路径！")
+            return {'CANCELLED'}
+        if len(props.layers) == 0:
+            self.report({'ERROR'}, "当前没有层可保存，请先读取 GDS！")
+            return {'CANCELLED'}
+        path = _sidecar_path(props.filepath)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(_config_from_props(props), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.report({'ERROR'}, f"保存失败: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"配置已保存: {os.path.basename(path)}")
+        return {'FINISHED'}
+
+class GDS_OT_LoadConfig(bpy.types.Operator):
+    bl_idname = "gds.load_config"
+    bl_label = "载入配置"
+    bl_description = "读取 GDS 旁的 .layers.json；层不一致则载入失败"
+
+    def execute(self, context):
+        props = context.scene.gds_props
+        if not props.filepath:
+            self.report({'ERROR'}, "请先指定 GDS 文件路径！")
+            return {'CANCELLED'}
+        if len(props.layers) == 0:
+            self.report({'ERROR'}, "请先读取 GDS 层再载入配置！")
+            return {'CANCELLED'}
+        path = _sidecar_path(props.filepath)
+        if not os.path.exists(path):
+            self.report({'ERROR'}, f"找不到配置文件: {os.path.basename(path)}")
+            return {'CANCELLED'}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.report({'ERROR'}, f"读取配置失败: {e}")
+            return {'CANCELLED'}
+        ok, msg = _apply_config(props, data)
+        if not ok:
+            self.report({'ERROR'}, f"载入失败 - {msg}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 # ==========================================
@@ -109,21 +266,19 @@ class GDS_OT_Generate3D(bpy.types.Operator):
 
         start_time = time.time()
         
-        base_name = "GDS_Chip_Root"
-        if props.keep_existing:
+        base_name = props.struct_name.strip() or "GDS_Chip"
+        if props.overwrite_same:
+            # 定向更新：同名结构存在则删除重建，其它结构不受影响
+            root_name = base_name
+            if root_name in bpy.data.objects:
+                self._remove_structure(bpy.data.objects[root_name])
+        else:
             # 自动寻找未被占用的编号名称
             root_name = base_name
             idx = 1
             while root_name in bpy.data.objects:
                 root_name = f"{base_name}_{idx:03d}"
                 idx += 1
-        else:
-            root_name = base_name
-            if root_name in bpy.data.objects:
-                root_obj = bpy.data.objects[root_name]
-                for child in root_obj.children:
-                    bpy.data.objects.remove(child, do_unlink=True)
-                bpy.data.objects.remove(root_obj, do_unlink=True)
 
         chip_root = bpy.data.objects.new(root_name, None)
         bpy.context.collection.objects.link(chip_root)
@@ -171,6 +326,27 @@ class GDS_OT_Generate3D(bpy.types.Operator):
         end_time = time.time()
         self.report({'INFO'}, f"渲染完成！耗时: {end_time - start_time:.2f} 秒")
         return {'FINISHED'}
+
+    def _remove_structure(self, root_obj):
+        """删除结构根物体及其全部子物体，并清理由此产生的孤立 mesh 与材质，
+        避免反复重载同名结构导致 .blend 里残留 Mat_xxx.001 与孤立网格无限堆积。"""
+        objs = list(root_obj.children) + [root_obj]
+        meshes = set()
+        mats = set()
+        for o in objs:
+            if o.type == 'MESH' and o.data is not None:
+                meshes.add(o.data)
+                for m in o.data.materials:
+                    if m is not None:
+                        mats.add(m)
+        for o in objs:
+            bpy.data.objects.remove(o, do_unlink=True)
+        for me in meshes:
+            if me.users == 0:
+                bpy.data.meshes.remove(me)
+        for ma in mats:
+            if ma.users == 0:
+                bpy.data.materials.remove(ma)
 
     def create_substrate(self, xmin, ymin, xmax, ymax, props, parent):
         name = "GDS_Substrate"
@@ -293,6 +469,9 @@ class GDS_PT_MainPanel(bpy.types.Panel):
         box = layout.box()
         box.prop(props, "filepath")
         box.operator("gds.load_layers", icon='FILE_REFRESH')
+        cfg_row = box.row(align=True)
+        cfg_row.operator("gds.save_config", icon='FILE_TICK')
+        cfg_row.operator("gds.load_config", icon='IMPORT')
         
         layout.separator()
         layout.prop(props, "scale")
@@ -331,11 +510,12 @@ class GDS_PT_MainPanel(bpy.types.Panel):
                     col.prop(item, "thickness")
 
             layout.separator()
-            layout.prop(props, "keep_existing", icon='DUPLICATE')
+            layout.prop(props, "struct_name")
+            layout.prop(props, "overwrite_same", icon='DUPLICATE')
             layout.scale_y = 1.5
             layout.operator("gds.generate_3d", icon='MOD_BUILD')
 
-classes = (GDSLayerItem, GDSSceneProperties, GDS_OT_LoadLayers, GDS_OT_Generate3D, GDS_PT_MainPanel)
+classes = (GDSLayerItem, GDSSceneProperties, GDS_OT_LoadLayers, GDS_OT_SaveConfig, GDS_OT_LoadConfig, GDS_OT_Generate3D, GDS_PT_MainPanel)
 def register():
     for cls in classes: bpy.utils.register_class(cls)
     bpy.types.Scene.gds_props = bpy.props.PointerProperty(type=GDSSceneProperties)
