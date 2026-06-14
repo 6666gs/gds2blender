@@ -58,6 +58,15 @@ class GDSSceneProperties(bpy.types.PropertyGroup):
         default=True
     )
 
+    struct_location: bpy.props.FloatVectorProperty(
+        name="结构位置 (微米 XYZ)",
+        description="本次生成结构整体放置坐标，单位微米，与版图坐标对齐（内部按 scale 换算到 Blender 世界单位）",
+        size=3,
+        subtype='XYZ',
+        default=(0.0, 0.0, 0.0),
+        step=10
+    )
+
     layers: bpy.props.CollectionProperty(type=GDSLayerItem)
 
 # ==========================================
@@ -79,6 +88,7 @@ def _config_from_props(props):
         "schema": 1,
         "source": os.path.basename(bpy.path.abspath(props.filepath)),
         "scale": props.scale,
+        "struct_location": list(props.struct_location),
         "substrate": {
             "use": props.use_substrate,
             "z_start": props.sub_z_start,
@@ -113,6 +123,10 @@ def _apply_config(props, data):
 
     if "scale" in data:
         props.scale = data["scale"]
+
+    loc = data.get("struct_location")
+    if loc and len(loc) == 3:
+        props.struct_location = tuple(loc)
 
     sub = data.get("substrate")
     if sub:
@@ -282,6 +296,8 @@ class GDS_OT_Generate3D(bpy.types.Operator):
 
         chip_root = bpy.data.objects.new(root_name, None)
         bpy.context.collection.objects.link(chip_root)
+        # 结构位置按微米输入，乘以 scale 换算到 Blender 世界单位，与版图坐标对齐
+        chip_root.location = tuple(c * props.scale for c in props.struct_location)
 
         lib = gdspy.GdsLibrary(infile=props.filepath)
         top_cell = next((c for c in lib.top_level() if not c.name.startswith('$$$')), lib.top_level()[-1])
@@ -511,6 +527,7 @@ class GDS_PT_MainPanel(bpy.types.Panel):
 
             layout.separator()
             layout.prop(props, "struct_name")
+            layout.prop(props, "struct_location")
             layout.prop(props, "overwrite_same", icon='DUPLICATE')
             layout.scale_y = 1.5
             layout.operator("gds.generate_3d", icon='MOD_BUILD')
