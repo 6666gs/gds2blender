@@ -16,6 +16,10 @@ env/
 *.blend2
 *.blend3
 
+# 渲染输出 / 导出模型（可由 microlens.py 重新生成）
+renders/
+exports/
+
 # GDS / data files
 *.gds
 *.GDS
