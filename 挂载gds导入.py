@@ -19,7 +19,7 @@ class GDSLayerItem(bpy.types.PropertyGroup):
         name="方向",
         items=[
             ('UP', '向上 (生长/沉积)', '向上挤出厚度'),
-            ('DOWN', '向下 (刻蚀/挖槽)', '生成反转掩膜并向下挤出')
+            ('DOWN', '向下 (刻蚀/挖槽)', '真实布尔挖槽：从所有 Z 向重叠的实体上减去该形状，切面继承被切层材质')
         ],
         default='UP'
     )
@@ -27,8 +27,15 @@ class GDSLayerItem(bpy.types.PropertyGroup):
     z_start: bpy.props.FloatProperty(name="Z起点", default=0.0, step=10)
     thickness: bpy.props.FloatProperty(name="厚度", default=0.22, min=0.0, step=1)
     color: bpy.props.FloatVectorProperty(
-        name="颜色", subtype='COLOR', size=4, 
+        name="颜色", subtype='COLOR', size=4,
         default=(0.5, 0.5, 0.5, 1.0), min=0.0, max=1.0
+    )
+    carve_targets: bpy.props.StringProperty(
+        name="挖槽目标层",
+        description=("仅向下层有效：逗号分隔的目标层名，该层只从这些层上减去。"
+                     "填 基底 可切入 Substrate；填 * 表示切所有重叠实体；留空则不挖任何层。"
+                     "（这样可在槽内再放一层向上生长结构而不被切到）"),
+        default=""
     )
 
 class GDSSceneProperties(bpy.types.PropertyGroup):
@@ -88,6 +95,7 @@ def _config_from_props(props):
         "schema": 1,
         "source": os.path.basename(bpy.path.abspath(props.filepath)),
         "scale": props.scale,
+        "struct_name": props.struct_name,
         "struct_location": list(props.struct_location),
         "substrate": {
             "use": props.use_substrate,
@@ -107,6 +115,7 @@ def _config_from_props(props):
                 "z_start": it.z_start,
                 "thickness": it.thickness,
                 "color": list(it.color),
+                "carve_targets": it.carve_targets,
             }
             for it in props.layers
         ],
@@ -123,6 +132,9 @@ def _apply_config(props, data):
 
     if "scale" in data:
         props.scale = data["scale"]
+
+    if "struct_name" in data:
+        props.struct_name = data["struct_name"]
 
     loc = data.get("struct_location")
     if loc and len(loc) == 3:
@@ -149,6 +161,8 @@ def _apply_config(props, data):
             it.extrude_dir = l["dir"]
         it.z_start = l.get("z_start", it.z_start)
         it.thickness = l.get("thickness", it.thickness)
+        if "carve_targets" in l:
+            it.carve_targets = l["carve_targets"]
         if "name" in l:
             it.layer_name = l["name"]
         if "color" in l:
@@ -304,44 +318,118 @@ class GDS_OT_Generate3D(bpy.types.Operator):
         
         bbox = top_cell.get_bounding_box()
 
+        # 挖槽目标登记表：每项为 dict(obj, lo, hi, name, sub)，z 单位微米
+        carve_targets = []
+
         if props.use_substrate and bbox is not None:
             (xmin, ymin), (xmax, ymax) = bbox
-            self.create_substrate(xmin, ymin, xmax, ymax, props, chip_root)
+            sub_obj = self.create_substrate(xmin, ymin, xmax, ymax, props, chip_root)
+            if sub_obj is not None:
+                # 基底自顶面 sub_z_start 向下挤出 sub_thickness
+                carve_targets.append({
+                    'obj': sub_obj,
+                    'lo': props.sub_z_start - props.sub_thickness,
+                    'hi': props.sub_z_start,
+                    'name': 'GDS_Substrate', 'sub': True,
+                })
 
         all_polys = top_cell.get_polygons(by_spec=True)
 
+        # === 第一遍：生成所有"向上生长"实体层，登记为可被挖槽的目标 ===
         for item in props.layers:
             if not item.is_active: continue
+            if item.extrude_dir != 'UP': continue
             spec = (item.layer_num, item.datatype_num)
             if spec not in all_polys: continue
 
-            raw_polys = all_polys[spec]
-            target_polys = raw_polys
-
-            # --- 核心更新：2D 掩膜反转刻蚀法 ---
-            if item.extrude_dir == 'DOWN' and bbox is not None:
-                (xmin, ymin), (xmax, ymax) = bbox
-                # 刻蚀掩膜与基底保持相同边界
-                rect = gdspy.Rectangle(
-                    (xmin - props.sub_pad_xmin, ymin - props.sub_pad_ymin),
-                    (xmax + props.sub_pad_xmax, ymax + props.sub_pad_ymax)
-                )
-                try:
-                    print(f"[{item.layer_name}] 正在计算 2D 刻蚀掩膜 (这可能需要几秒钟)...")
-                    # 使用 gdspy 高效运算：外框 减去 波导形状
-                    inverse_polys = gdspy.boolean(rect, raw_polys, 'not')
-                    if inverse_polys is not None:
-                        target_polys = inverse_polys
-                except Exception as e:
-                    print(f"[{item.layer_name}] 布尔反转失败: {e}")
-                    
-            obj = self.create_mesh_fast(item, target_polys, props.scale)
+            obj = self.create_mesh_fast(item, all_polys[spec], props.scale)
             if obj:
                 obj.parent = chip_root
+                carve_targets.append({
+                    'obj': obj,
+                    'lo': item.z_start,
+                    'hi': item.z_start + item.thickness,
+                    'name': item.layer_name, 'sub': False,
+                })
+
+        # === 第二遍：向下挖槽层作为"切刀"，只对其指定的目标层做真实布尔减法 ===
+        # 切刀本身不渲染、烘焙后即删除；未被指定的层(例如槽内再放的向上生长层)不受影响。
+        SPEC_ALL = ('*', '全部', 'all')
+        SPEC_SUB = ('基底', 'substrate', 'gds_substrate')
+        for item in props.layers:
+            if not item.is_active: continue
+            if item.extrude_dir != 'DOWN': continue
+            spec = (item.layer_num, item.datatype_num)
+            if spec not in all_polys: continue
+
+            # 解析"挖槽目标层"文本：逗号(中英)分隔的层名 / 基底 / *
+            raw = item.carve_targets.replace('，', ',').replace('；', ',').replace(';', ',')
+            tokens = [t.strip() for t in raw.split(',') if t.strip()]
+            if not tokens:
+                print(f"[{item.layer_name}] 未指定挖槽目标层，跳过（不挖任何层）")
+                continue
+            low = [t.lower() for t in tokens]
+            want_all = any(t in SPEC_ALL for t in low)
+            want_sub = any(t in SPEC_SUB for t in low)
+            name_set = {t for t in low if t not in SPEC_ALL and t not in SPEC_SUB}
+
+            selected = [
+                e for e in carve_targets
+                if want_all
+                or (e['sub'] and want_sub)
+                or ((not e['sub']) and e['name'].lower() in name_set)
+            ]
+            if not selected:
+                print(f"[{item.layer_name}] 挖槽目标 {tokens} 未匹配到任何已生成实体，跳过")
+                continue
+
+            cutter = self.create_mesh_fast(item, all_polys[spec], props.scale, as_cutter=True)
+            if cutter is None: continue
+            cutter.name = f"__GDS_Cutter_{item.layer_name}"
+            # 与目标共享同一父变换，保证布尔运算在世界坐标下对齐
+            cutter.parent = chip_root
+
+            # 切刀自 z_start 向下挤出 thickness，故 Z 范围为 [z_start - thickness, z_start]
+            z_hi = item.z_start
+            z_lo = item.z_start - item.thickness
+            print(f"[{item.layer_name}] 真实布尔挖槽，目标: {[e['name'] for e in selected]}")
+            self._carve_targets(cutter, selected, z_lo, z_hi)
+
+            # 切刀几何已烘焙进各目标网格，删除自身，避免遮挡与 .blend 膨胀
+            cmesh = cutter.data
+            bpy.data.objects.remove(cutter, do_unlink=True)
+            if cmesh.users == 0:
+                bpy.data.meshes.remove(cmesh)
 
         end_time = time.time()
         self.report({'INFO'}, f"渲染完成！耗时: {end_time - start_time:.2f} 秒")
         return {'FINISHED'}
+
+    def _carve_targets(self, cutter, targets, z_lo, z_hi):
+        """用 cutter 对所有在 Z 向与 [z_lo, z_hi] 重叠的目标实体做布尔 DIFFERENCE 并烘焙。
+
+        切面会继承被切实体各自的材质，因此透明包层挖槽后仍是透明的，
+        不会再像旧的反转掩膜方案那样生成一块不透明板把其它层挡住。
+        """
+        for e in targets:
+            tobj, tzmin, tzmax = e['obj'], e['lo'], e['hi']
+            # Z 向不重叠则跳过，省去无谓的重型布尔运算
+            if z_hi <= tzmin or z_lo >= tzmax:
+                continue
+
+            mod = tobj.modifiers.new(name="GDS_Carve", type='BOOLEAN')
+            mod.operation = 'DIFFERENCE'
+            mod.solver = 'EXACT'
+            mod.object = cutter
+
+            with bpy.context.temp_override(
+                object=tobj, active_object=tobj, selected_objects=[tobj]
+            ):
+                try:
+                    bpy.ops.object.modifier_apply(modifier=mod.name)
+                except RuntimeError as e:
+                    print(f"[挖槽] 布尔应用失败 ({tobj.name}): {e}")
+                    tobj.modifiers.remove(mod)
 
     def _remove_structure(self, root_obj):
         """删除结构根物体及其全部子物体，并清理由此产生的孤立 mesh 与材质，
@@ -409,7 +497,9 @@ class GDS_OT_Generate3D(bpy.types.Operator):
         mat.diffuse_color = props.sub_color
         obj.data.materials.append(mat)
 
-    def create_mesh_fast(self, layer_item, poly_data, scale):
+        return obj
+
+    def create_mesh_fast(self, layer_item, poly_data, scale, as_cutter=False):
         name = layer_item.layer_name
         all_verts = []
         all_faces = []
@@ -452,6 +542,10 @@ class GDS_OT_Generate3D(bpy.types.Operator):
             bm.to_mesh(mesh)
             bm.free()
 
+        # 切刀仅用于布尔运算，烘焙后即删除，无需材质
+        if as_cutter:
+            return obj
+
         mat = bpy.data.materials.new(name=f"Mat_{name}")
         mat.use_nodes = True
         nodes = mat.node_tree.nodes
@@ -461,11 +555,11 @@ class GDS_OT_Generate3D(bpy.types.Operator):
             principled = nodes.new(type='ShaderNodeBsdfPrincipled')
             output = nodes.new(type='ShaderNodeOutputMaterial')
             mat.node_tree.links.new(principled.outputs[0], output.inputs[0])
-            
+
         principled.inputs['Base Color'].default_value = layer_item.color
-        mat.diffuse_color = layer_item.color 
+        mat.diffuse_color = layer_item.color
         obj.data.materials.append(mat)
-        
+
         return obj
 
 # ==========================================
@@ -521,9 +615,11 @@ class GDS_PT_MainPanel(bpy.types.Panel):
                 
                 if item.is_active:
                     col = box.column(align=True)
-                    col.prop(item, "extrude_dir") 
+                    col.prop(item, "extrude_dir")
                     col.prop(item, "z_start")
                     col.prop(item, "thickness")
+                    if item.extrude_dir == 'DOWN':
+                        col.prop(item, "carve_targets")
 
             layout.separator()
             layout.prop(props, "struct_name")
