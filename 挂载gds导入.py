@@ -1,9 +1,48 @@
 import bpy
 import bmesh
-import gdspy
 import os
 import time
 import json
+import sys
+
+# gdstk 取代已停止维护的 gdspy（gdspy 1.6 为最后大版本，官方建议迁移到 gdstk）。
+# gdstk 在 PyPI 提供 Windows 预编译 wheel，pip 基本一次过，免去编译麻烦。
+# 若 gdstk 未装进 Blender 自带 Python，用 Blender 的 python.exe 安装到独立目录：
+#   & "<Blender>\python\bin\python.exe" -m pip install --target="D:\blender_pylibs" gdstk
+# 然后取消下一行注释并改成你的目录（用 Blender 自己的 python 装能保证 ABI 匹配）：
+# sys.path.append(r"D:\blender_pylibs")
+import gdstk
+
+
+def _pick_top_cell(lib):
+    """选出真正的版图顶层 cell。
+    KLayout 等工具会写出名为 $$$CONTEXT_INFO$$$ 的元数据 cell：它带一块 0/0
+    标记多边形、并引用真正的版图 cell——导致真正的 cell 不在 top_level() 里、
+    而 0/0 被当成幻影层混进来。这里先剔除所有 $$$ 开头的 cell，再在剩下的 cell
+    中找出"没有被其它(非 $$$)cell 引用"的那个作为顶层。"""
+    cells = [c for c in lib.cells if not c.name.startswith('$$$')]
+    if not cells:
+        cells = list(lib.cells)
+    referenced = set()
+    for c in cells:
+        for ref in c.references:
+            rc = getattr(ref, 'cell', None)
+            nm = rc.name if hasattr(rc, 'name') else rc
+            if nm is not None:
+                referenced.add(nm)
+    tops = [c for c in cells if c.name not in referenced]
+    return tops[0] if tops else cells[-1]
+
+
+def _polys_by_spec(cell):
+    """模拟 gdspy 的 get_polygons(by_spec=True)：
+    返回 {(layer, datatype): [Nx2 点数组, ...]}。
+    gdstk 的 Cell.get_polygons() 返回一串 gdstk.Polygon，
+    每个有 .layer / .datatype / .points(Nx2 ndarray)，默认已递归展开引用。"""
+    result = {}
+    for p in cell.get_polygons():
+        result.setdefault((p.layer, p.datatype), []).append(p.points)
+    return result
 
 # ==========================================
 # 1. 数据结构
@@ -185,9 +224,9 @@ class GDS_OT_LoadLayers(bpy.types.Operator):
         props.layers.clear()
         
         try:
-            lib = gdspy.GdsLibrary(infile=props.filepath)
-            top_cell = next((c for c in lib.top_level() if not c.name.startswith('$$$')), lib.top_level()[-1])
-            layers_dict = top_cell.get_polygons(by_spec=True)
+            lib = gdstk.read_gds(props.filepath)
+            top_cell = _pick_top_cell(lib)
+            layers_dict = _polys_by_spec(top_cell)
             
             current_z = 0.0 
             for spec in sorted(layers_dict.keys()):
@@ -313,10 +352,10 @@ class GDS_OT_Generate3D(bpy.types.Operator):
         # 结构位置按微米输入，乘以 scale 换算到 Blender 世界单位，与版图坐标对齐
         chip_root.location = tuple(c * props.scale for c in props.struct_location)
 
-        lib = gdspy.GdsLibrary(infile=props.filepath)
-        top_cell = next((c for c in lib.top_level() if not c.name.startswith('$$$')), lib.top_level()[-1])
-        
-        bbox = top_cell.get_bounding_box()
+        lib = gdstk.read_gds(props.filepath)
+        top_cell = _pick_top_cell(lib)
+
+        bbox = top_cell.bounding_box()
 
         # 挖槽目标登记表：每项为 dict(obj, lo, hi, name, sub)，z 单位微米
         carve_targets = []
@@ -333,7 +372,7 @@ class GDS_OT_Generate3D(bpy.types.Operator):
                     'name': 'GDS_Substrate', 'sub': True,
                 })
 
-        all_polys = top_cell.get_polygons(by_spec=True)
+        all_polys = _polys_by_spec(top_cell)
 
         # === 第一遍：生成所有"向上生长"实体层，登记为可被挖槽的目标 ===
         for item in props.layers:
